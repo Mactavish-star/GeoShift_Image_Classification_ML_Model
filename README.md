@@ -34,7 +34,7 @@ This led us to design the solution around the following principle:
 
 ---
 
-## Our Approach
+## My Approach
 
 The final system combines five major ideas:
 
@@ -91,7 +91,7 @@ src/geoshift_convnext_vit_v2.py
 
 One of the main lessons from this competition was that increasing model complexity alone did not solve the problem.
 
-Our model development therefore focused on identifying **why earlier approaches were failing**.
+My model development therefore focused on identifying **why earlier approaches were failing**.
 
 ---
 
@@ -334,7 +334,7 @@ The dataset contains multiple classes with unequal representation.
 
 A direct approach is weighted cross-entropy.
 
-However, because the competition metric is Macro-F1, our objective is to improve balanced per-class decision boundaries.
+However, because the competition metric is Macro-F1, My objective is to improve balanced per-class decision boundaries.
 
 The final configuration therefore uses:
 
@@ -439,7 +439,7 @@ The source dynamically determines the feature-map shape from the selected ConvNe
 
 The original ConvNeXt model expects three RGB channels.
 
-Our input contains four or six channels.
+My input contains four or six channels.
 
 The first convolution is therefore replaced.
 
