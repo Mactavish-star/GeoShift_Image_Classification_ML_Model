@@ -1,91 +1,125 @@
 # GeoShift — Region-Aware Multispectral Image Classification
 
-A region-shift-robust image classification pipeline for the GeoShift competition using a **ConvNeXt-Tiny backbone with a lightweight Vision Transformer (ViT) head**.
+> **A region-shift-robust classification pipeline for 64×64 multispectral imagery using ConvNeXt-Tiny + Vision Transformer**
 
-The model classifies 64×64 multispectral image patches into six land-cover classes while explicitly accounting for **geographic distribution shift** between training and validation regions.
+## 1. Overview
 
----
+GeoShift is a six-class land-cover image classification problem based on small multispectral image patches.
 
-## Overview
+The six classes are:
 
-GeoShift is a six-class image classification problem with small 64×64 multispectral image patches.
+| Class ID | Class         |
+| -------: | ------------- |
+|        0 | Forest        |
+|        1 | Shrubland     |
+|        2 | Grassland     |
+|        3 | Cropland      |
+|        4 | Built-up      |
+|        5 | Water/Wetland |
 
-The main challenge is not only image classification, but **generalisation to previously unseen geographic regions**. A model can obtain an optimistic validation score if visually similar samples from the same region appear in both training and validation.
+Each sample is a **64×64 four-band multispectral image** containing:
 
-Our solution therefore treats region as a grouping variable and evaluates the model using **StratifiedGroupKFold**, ensuring that validation regions are not present in the corresponding training split.
+* Blue
+* Green
+* Red
+* Near Infrared (NIR)
 
-The final pipeline combines:
+The primary evaluation metric is **Macro-F1**.
 
-* Region-aware cross-validation
-* Four-band multispectral input: B, G, R, NIR
-* Derived NDVI and NDWI features
-* ConvNeXt-Tiny feature extraction
-* Vision Transformer classification head
-* GPU-based geometric and radiometric augmentation
-* MixUp / CutMix
-* Logit-adjusted cross-entropy
-* AdamW with layer-wise learning-rate decay
-* Exponential moving average (EMA)
-* Early stopping using validation Macro-F1
-* Eight-way test-time augmentation
-* Fold ensembling
-* Out-of-fold class-bias tuning for Macro-F1
+The central challenge is not merely classifying the training distribution. The competition is designed around **geographic distribution shift**, so the model must generalise to regions that may not have been represented during training.
 
----
+This led us to design the solution around the following principle:
 
-## Classes
-
-The classifier predicts six classes:
-
-| ID | Class         |
-| -: | ------------- |
-|  0 | Forest        |
-|  1 | Shrubland     |
-|  2 | Grassland     |
-|  3 | Cropland      |
-|  4 | Built-up      |
-|  5 | Water/Wetland |
+> **Validation, feature representation, augmentation and inference should all reflect the geographic shift present in the competition.**
 
 ---
 
-## Input Data
+# 2. Our Approach
 
-The model expects four-band 64×64 image patches:
+The final system combines five major ideas:
 
 ```text
-Input shape:
-(N, 4, 64, 64)
-
-Bands:
-1. Blue
-2. Green
-3. Red
-4. Near Infrared (NIR)
+                    GeoShift Pipeline
+                           │
+            ┌──────────────┴──────────────┐
+            │                             │
+     Region-aware CV              Multispectral features
+            │                             │
+            ▼                             ▼
+ StratifiedGroupKFold               B,G,R,NIR
+  by geographic region                 +
+                                      NDVI
+                                      NDWI
+            │                             │
+            └──────────────┬──────────────┘
+                           ▼
+                 ConvNeXt-Tiny Backbone
+                           │
+                           ▼
+                    Spatial tokens
+                           │
+                           ▼
+                Vision Transformer Head
+                           │
+                           ▼
+               6-class classification
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+      EMA weights     8-way TTA       Fold ensemble
+          │                │                │
+          └────────────────┴────────────────┘
+                           ▼
+                    OOF predictions
+                           │
+                           ▼
+                  Class-bias tuning
+                           │
+                           ▼
+                     Submission
 ```
 
-The implementation optionally derives two additional spectral indices:
+The final implementation is contained in:
 
 ```text
-NDVI = (NIR - Red) / (NIR + Red + eps)
-
-NDWI = (Green - NIR) / (Green + NIR + eps)
+src/geoshift_convnext_vit_v2.py
 ```
-
-Therefore, with `use_indices=True`, the model receives:
-
-```text
-6 channels = B + G + R + NIR + NDVI + NDWI
-```
-
-These additional features provide explicit spectral information related to vegetation and water/wetland characteristics.
 
 ---
 
-# Methodology
+# 3. What Did Not Work?
 
-## 1. Region-aware validation
+One of the main lessons from this competition was that increasing model complexity alone did not solve the problem.
 
-Instead of using a conventional random train/validation split, we use:
+Our model development therefore focused on identifying **why earlier approaches were failing**.
+
+---
+
+## 3.1 Random 80/20 Validation
+
+### Initial approach
+
+A conventional random train/validation split was initially considered.
+
+```text
+Random 80%
+   │
+   ├── Train
+   │
+   └── Validation
+```
+
+### Problem
+
+Samples from the same geographic region can appear in both sets.
+
+That means the validation set can contain regional characteristics already represented during training.
+
+For a geographic-shift problem, this can produce an overly optimistic estimate of generalisation.
+
+### Change
+
+The final pipeline uses:
 
 ```text
 StratifiedGroupKFold
@@ -93,427 +127,617 @@ StratifiedGroupKFold
 
 with geographic region as the grouping variable.
 
-The objective is:
+Therefore:
 
 ```text
-Training regions != Validation regions
+Validation regions
+        ∩
+Training regions
+        =
+        ∅
 ```
 
-This provides a more realistic estimate of performance under geographic distribution shift.
+The uploaded implementation explicitly extracts region identifiers and uses them as groups in `StratifiedGroupKFold`.
 
-Normalization statistics are also computed **only from the training portion of each fold**, preventing information leakage from the validation region.
+### Lesson
 
-Out-of-fold (OOF) predictions are collected across the complete training set for downstream analysis and class-bias tuning.
+> In GeoShift, validation strategy is part of the model design.
 
 ---
 
-## 2. Feature engineering
+# 4. Why a Standard CNN Was Not Enough
 
-The original four spectral bands are converted from uint8 to normalized floating-point values.
+The problem contains two different kinds of information:
 
-Two spectral indices are additionally calculated:
+### Local information
 
-### NDVI
+Examples:
 
-Measures vegetation-related spectral contrast:
+* textures
+* edges
+* spectral patterns
+* small spatial structures
 
-```text
-NDVI = (NIR - Red) / (NIR + Red)
-```
+### Spatial context
 
-### NDWI
+Examples:
 
-Provides additional information useful for distinguishing water and related land-cover conditions:
+* arrangement of vegetation
+* boundaries between land-cover types
+* relationships between different spatial regions
 
-```text
-NDWI = (Green - NIR) / (Green + NIR)
-```
+A conventional CNN/GAP pipeline compresses spatial information aggressively before classification.
 
-The resulting six-channel tensor is supplied to the neural network.
-
----
-
-# Model Architecture
-
-## ConvNeXt-Tiny + ViT Head
-
-The backbone is a pretrained ConvNeXt-Tiny network.
-
-Instead of using the complete backbone output, the implementation can stop after an earlier ConvNeXt stage and convert the spatial feature map into tokens.
-
-For the default configuration:
-
-```text
-Input
-  │
-  ├── B
-  ├── G
-  ├── R
-  ├── NIR
-  ├── NDVI
-  └── NDWI
-  │
-  ▼
-ConvNeXt-Tiny
-  │
-  └── Features through stage 3
-  │
-  ▼
-Spatial feature map
-  │
-  ▼
-Flatten spatial dimensions into tokens
-  │
-  ▼
-LayerNorm + Linear token projection
-  │
-  ▼
-[CLS] token + positional embeddings
-  │
-  ▼
-2-layer Transformer encoder
-  │
-  ▼
-LayerNorm
-  │
-  ▼
-MLP classifier
-  │
-  ▼
-6-class logits
-```
-
-The model can also be configured with a GAP classification head for controlled ablation experiments.
+We therefore investigated a design where convolutional features are converted into spatial tokens and processed by a Transformer.
 
 ---
 
-# Pretrained Weight Adaptation
+# 5. Why the Original ConvNeXt + ViT Arrangement Was Weak
 
-The original ConvNeXt stem is designed for three-channel RGB input.
+A particularly important issue was discovered in the feature extraction stage.
 
-The first convolution is therefore modified to support either:
+With a 64×64 input, using the full ConvNeXt backbone resulted in a very small spatial representation at the point where the Transformer receives its tokens.
 
-```text
-4 channels
-```
-
-or:
+The earlier pipeline effectively produced:
 
 ```text
-6 channels
+2 × 2 spatial feature map
+        ↓
+4 spatial tokens
 ```
 
-when the spectral indices are enabled.
+The problem is that the Transformer then has almost no spatial structure to model.
 
-The pretrained RGB filters are transferred into the corresponding multispectral channels, while the NIR and derived-index channels are initialized from the mean pretrained filters with smaller initial weights.
+In addition, the deeper backbone provides additional capacity that can make it easier for the model to learn region-specific signatures rather than useful transferable features.
 
-This allows the model to retain useful ImageNet representations while adapting the input layer to multispectral imagery.
+The final implementation therefore stops at **ConvNeXt stage 3**.
+
+For the default configuration this produces:
+
+```text
+4 × 4 feature map
+        ↓
+16 spatial tokens
+```
+
+The uploaded source explicitly describes this motivation and contrasts it with the previous 2×2 representation.
+
+### Alternative tested
+
+A higher-resolution configuration is also available:
+
+```text
+stem_stride = 2
+```
+
+which increases the spatial feature map to:
+
+```text
+8 × 8
+=
+64 tokens
+```
+
+## This is provided as the `hires` experiment preset.
+
+# 6. Why RGB-Only Representation Was Insufficient
+
+The dataset contains four spectral bands rather than ordinary RGB.
+
+Using only RGB discards information contained in NIR.
+
+The final model therefore operates directly on:
+
+```text
+B
+G
+R
+NIR
+```
+
+and optionally derives two additional physically meaningful spectral indices.
 
 ---
 
-# Data Augmentation
+# 7. Feature Engineering
 
-Augmentation is performed directly on tensors and is designed to improve robustness to geographic and radiometric variation.
+## NDVI
+
+```text
+NDVI = (NIR - Red) / (NIR + Red + ε)
+```
+
+NDVI provides an explicit vegetation-related spectral relationship.
+
+## NDWI
+
+```text
+NDWI = (Green - NIR) / (Green + NIR + ε)
+```
+
+NDWI provides additional information useful for distinguishing water and related land-cover conditions.
+
+The final model therefore uses:
+
+```text
+B + G + R + NIR + NDVI + NDWI
+```
+
+when:
+
+```python
+use_indices = True
+```
+
+The actual implementation constructs these channels directly in the training pipeline.
+
+---
+
+# 8. Why Standard Augmentation Was Not Enough
+
+Ordinary image augmentation mainly addresses spatial variation.
+
+However, geographic shift can also produce differences in:
+
+* illumination
+* sensor response
+* scene brightness
+* per-band intensity
+* regional imaging conditions
+
+A model that relies too strongly on these radiometric properties can learn region-specific shortcuts.
+
+Therefore, augmentation was designed specifically to simulate this type of variation.
+
+---
+
+# 9. Shift-Oriented Data Augmentation
+
+The training pipeline performs augmentation directly on tensors.
 
 ## Geometric augmentation
 
-A full 8-way dihedral transformation group is used:
+The complete 8-way dihedral group is used:
 
 ```text
-4 rotations × optional horizontal flip
-= 8 possible transformations
+4 rotations
+×
+optional horizontal flip
+=
+8 transformations
 ```
 
-Random zoom/translation crops are also applied.
+Random zoom / translation crops are also applied.
 
 ## Radiometric augmentation
 
-The training pipeline applies:
+The model receives:
 
-* Global gain jitter
-* Per-channel gain jitter
-* Per-channel additive bias
+* global gain jitter
+* per-channel gain jitter
+* additive per-channel bias
 * Gaussian noise
-* Value clipping
+* clipping
 
-These transformations simulate changes in illumination and sensor/radiometric conditions between geographic regions.
-
-## Batch-level augmentation
+## Regularisation
 
 Low-probability:
 
 * MixUp
 * CutMix
 
-are used to improve class-boundary regularisation.
+are applied after the image-level transformation stage.
 
----
+These operations are intended to reduce dependence on superficial regional characteristics.
 
-# Loss Function
+## The actual implementation performs these transformations on the GPU.
 
-The default loss is:
+# 10. Loss Function: Why Weighted Cross-Entropy Was Reconsidered
+
+The dataset contains multiple classes with unequal representation.
+
+A direct approach is weighted cross-entropy.
+
+However, because the competition metric is Macro-F1, our objective is to improve balanced per-class decision boundaries.
+
+The final configuration therefore uses:
 
 ```text
 Logit-adjusted Cross-Entropy
++
+Label smoothing
 ```
 
-with label smoothing.
+instead of the earlier weighted-CE approach.
 
-The motivation is to account for class-prior imbalance directly in the decision boundary rather than relying only on explicit loss weighting.
+The implementation keeps weighted cross-entropy as an experimental alternative via:
 
-An alternative weighted cross-entropy implementation is also available for ablation experiments.
+```python
+loss_mode = "weighted_ce"
+```
+
+while the default is:
+
+```python
+loss_mode = "logit_adjusted"
+```
+
+## The two loss modes are implemented in the same training code for controlled comparison.
+
+# 11. Optimisation Problems Discovered During Development
+
+Another issue was not model architecture but optimisation behaviour.
+
+The earlier learning-rate plateau mechanism was effectively overwritten when the next epoch recomputed the learning rate from the base cosine schedule.
+
+Therefore, the intended plateau reduction did not persist.
+
+The final implementation introduced a persistent learning-rate multiplier:
+
+```text
+LR = base_LR × cosine_factor × plateau_scale
+```
+
+where:
+
+```text
+plateau_scale
+```
+
+is reduced when validation Macro-F1 stops improving.
+
+This bug is explicitly documented in the source.
 
 ---
 
-# Optimisation
+# 12. Final Model Architecture
 
-The model is trained using:
+The final default model is:
 
 ```text
-Optimizer:
-AdamW
-
-Weight decay:
-0.05
-
-Backbone learning rate:
-1e-4
-
-Stem learning rate:
-2e-4
-
-Head learning rate:
-5e-4
-
-Layer-wise LR decay:
-0.85
-
-Gradient clipping:
-1.0
-
-EMA:
-enabled
-
-Learning-rate schedule:
-warm-up + cosine decay
+Input
+64 × 64 × 6
+(B, G, R, NIR, NDVI, NDWI)
+        │
+        ▼
+Modified ConvNeXt-Tiny stem
+        │
+        ▼
+ConvNeXt stages 1–3
+        │
+        ▼
+4 × 4 × 384 feature map
+        │
+        ▼
+16 spatial tokens
+        │
+        ▼
+LayerNorm
+        │
+        ▼
+Linear token projection
+        │
+        ▼
+[CLS] token
++
+positional embeddings
+        │
+        ▼
+2-layer Transformer encoder
+        │
+        ▼
+LayerNorm
+        │
+        ▼
+MLP classification head
+        │
+        ▼
+6 logits
 ```
 
-The backbone and classification head use different learning rates, allowing the pretrained backbone to change more conservatively while the newly initialized head learns faster.
-
-The implementation also includes a persistent plateau-based learning-rate multiplier and early stopping based on validation Macro-F1.
+The source dynamically determines the feature-map shape from the selected ConvNeXt stages rather than hard-coding the spatial dimensions.
 
 ---
 
-# Evaluation Metric
+# 13. Pretrained Weight Adaptation
 
-The primary optimisation metric is:
+The original ConvNeXt model expects three RGB channels.
+
+Our input contains four or six channels.
+
+The first convolution is therefore replaced.
+
+The pretrained RGB filters are transferred into the corresponding multispectral channels, while the additional NIR/index channels receive smaller initial weights.
+
+Conceptually:
 
 ```text
-Macro-F1
+Pretrained RGB convolution
+          │
+          ▼
+Modified multispectral stem
+
+RGB → corresponding spectral channels
+NIR → mean pretrained filter
+NDVI/NDWI → small initial weights
 ```
 
-Macro-F1 is computed as the unweighted mean of per-class F1 scores:
-
-```text
-Macro-F1 = (F1_1 + F1_2 + ... + F1_6) / 6
-```
-
-This treats all six classes equally and prevents dominant classes from completely determining the evaluation metric.
+This allows us to retain useful pretrained representations without treating the multispectral image as an entirely new problem.
 
 ---
 
-# Cross-Validation Pipeline
+# 14. Training Methodology
 
-The complete training process is:
+Each fold follows the same procedure.
 
 ```text
-Dataset
-   │
-   ▼
-Extract regions
-   │
-   ▼
-StratifiedGroupKFold
-   │
-   ├── Fold 0
-   ├── Fold 1
-   ├── Fold 2
-   ├── Fold 3
-   └── Fold 4
-   │
-   ▼
-For each fold:
-   ├── Compute train-only statistics
-   ├── Train model
-   ├── Track validation Macro-F1
-   ├── Save best EMA checkpoint
-   ├── Generate OOF predictions
-   └── Generate test predictions
-   │
-   ▼
-Average fold probabilities
-   │
-   ▼
-8-way TTA
-   │
-   ▼
-OOF analysis
-   │
-   ▼
-Optional class log-probability bias tuning
-   │
-   ▼
-Final submission
+1. Split by region
+       ↓
+2. Compute train-only normalization statistics
+       ↓
+3. Build model
+       ↓
+4. Initialise optimizer
+       ↓
+5. Train with augmentation
+       ↓
+6. Update EMA model
+       ↓
+7. Evaluate validation Macro-F1
+       ↓
+8. Save best EMA checkpoint
+       ↓
+9. Generate OOF predictions
+       ↓
+10. Generate test probabilities
 ```
+
+Normalization statistics are calculated separately for each fold using only the training samples.
+
+## The training loop uses mixed precision when CUDA is available, gradient clipping, EMA and early stopping.
+
+# 15. Why EMA Is Used
+
+Instead of relying directly on the instantaneous model weights, the implementation maintains an:
+
+```text
+Exponential Moving Average (EMA)
+```
+
+of the model.
+
+Validation is performed using the EMA model.
+
+This provides a more stable representation of the model state across training updates.
+
+The EMA decay is also warmed up during early training rather than immediately applying the full decay to randomly initialized weights.
 
 ---
 
-# Test-Time Augmentation and Ensemble
+# 16. Learning Rate Strategy
 
-At inference time, each image can be evaluated under all eight dihedral transformations.
+Different parts of the network use different learning rates.
 
-The resulting class probabilities are averaged:
+Default configuration:
 
 ```text
-P_final = mean(P_1, P_2, ..., P_8)
+Backbone      1e-4
+Stem          2e-4
+Transformer   5e-4
+Weight decay  0.05
+LLRD          0.85
 ```
 
-Predictions are then averaged across the trained folds.
+The backbone uses layer-wise learning-rate decay so that earlier layers change more conservatively than later layers.
 
-This produces the final ensemble probability distribution.
+This is useful because the backbone contains pretrained features while the Transformer head is largely task-specific.
+
+The optimiser implementation creates separate parameter groups for the stem, backbone layers and head.
 
 ---
 
-# OOF Class-Bias Tuning
+# 17. Cross-Validation Strategy
 
-After generating OOF predictions, the implementation optionally searches for a per-class log-probability offset:
+The final system uses:
 
 ```text
+5-fold StratifiedGroupKFold
+```
+
+with:
+
+```text
+group = geographic region
+stratification = target class
+```
+
+Each validation fold therefore contains regions not used for training in that fold.
+
+Example:
+
+```text
+Fold 0
+
+Training:
+R01 R02 R03 R04 ... R20
+
+Validation:
+R21 R22 R23
+```
+
+The exact region allocation is generated from the supplied metadata.
+
+---
+
+# 18. Out-of-Fold Predictions
+
+After each fold is trained, predictions are generated for the fold's validation samples.
+
+These predictions are stored as:
+
+```text
+oof_fold0.npz
+oof_fold1.npz
+...
+```
+
+The OOF predictions are then combined into a complete prediction set covering the training data.
+
+This allows:
+
+* unbiased-ish validation analysis under the chosen grouped split
+* confusion-matrix analysis
+* per-class performance analysis
+* region-wise error analysis
+* class-bias tuning
+
+The code reconstructs the complete OOF array from fold-level predictions.
+
+---
+
+# 19. Test-Time Augmentation
+
+At inference time, the image is transformed using all eight dihedral views:
+
+```text
+Original
+Rotate 90°
+Rotate 180°
+Rotate 270°
+Flip
+Flip + Rotate 90°
+Flip + Rotate 180°
+Flip + Rotate 270°
+```
+
+Predictions from all views are averaged.
+
+```text
+P_TTA = mean(P_1 ... P_8)
+```
+
+The inference implementation performs this averaging explicitly.
+
+---
+
+# 20. Fold Ensembling
+
+Each fold produces a probability distribution for each test sample.
+
+The final test probability is:
+
+```text
+P_ensemble =
+mean(P_fold0,
+     P_fold1,
+     ...,
+     P_fold4)
+```
+
+This reduces dependence on the particular region split of an individual model.
+
+The final implementation averages the saved fold probabilities before creating the submission.
+
+---
+
+# 21. OOF Class-Bias Tuning
+
+The OOF predictions are also used to tune class-specific log-probability offsets.
+
+For each class:
+
+```text
+Adjusted log probability
+=
 log(P_class) + bias_class
 ```
 
-The class biases are selected using OOF predictions to maximise Macro-F1.
+The bias values are selected by searching for an increase in OOF Macro-F1.
 
-Two submissions are produced:
+This produces two submissions:
 
 ```text
 submission_v2_nobias.csv
 submission_v2_bias.csv
 ```
 
-The README/reported leaderboard score should clearly distinguish between these two variants.
+## The source itself warns that this is an in-sample optimisation on OOF predictions, so the apparent gain should not automatically be expected to transfer completely to the leaderboard.
 
----
+# 22. Current Pipeline — Exact Flow
 
-# Experiment Presets
-
-The implementation contains several controlled presets for ablation studies:
-
-| Preset     | Purpose                                |
-| ---------- | -------------------------------------- |
-| `tuned`    | Default configuration                  |
-| `orig`     | Compare against earlier configuration  |
-| `hires`    | Higher-resolution ConvNeXt feature map |
-| `perimage` | Per-image band normalisation           |
-| `gap`      | Replace ViT head with GAP head         |
-| `regbal`   | Region-balanced sampling               |
-| `tau05`    | Reduced logit-adjustment strength      |
-
-These experiments help isolate the contribution of architectural, normalisation, sampling and loss-function choices.
-
----
-
-# Results
-
-## Cross-validation
-
-Fill this table using the final competition run:
-
-|     Fold | Best Val Macro-F1 | 8× TTA Macro-F1 |
-| -------: | ----------------: | --------------: |
-|        0 |         `XX.XXXX` |       `XX.XXXX` |
-|        1 |         `XX.XXXX` |       `XX.XXXX` |
-|        2 |         `XX.XXXX` |       `XX.XXXX` |
-|        3 |         `XX.XXXX` |       `XX.XXXX` |
-|        4 |         `XX.XXXX` |       `XX.XXXX` |
-| **Mean** |       **XX.XXXX** |     **XX.XXXX** |
-
-## Final OOF Performance
+The complete final pipeline can be summarised as:
 
 ```text
-Raw OOF Macro-F1:
-XX.XXXX
-
-Bias-tuned OOF Macro-F1:
-XX.XXXX
-```
-
-## Competition Result
-
-```text
-Final leaderboard Macro-F1:
-XX.XXXX
-```
-
-Do not report the leaderboard number here until it has been verified from the actual submission.
-
----
-
-# Error Analysis
-
-Recommended analyses:
-
-1. Per-class precision, recall and F1
-2. Confusion matrix
-3. Region-wise accuracy
-4. Hardest regions
-5. Class distribution comparison
-6. Examples of confidently misclassified samples
-
-The training pipeline automatically generates:
-
-```text
-oof_confusion_matrix.csv
-oof_region_accuracy.csv
-classification report
-```
-
-These files should be included in `results/metrics/` for reproducibility.
-
----
-
-# Installation
-
-```bash
-git clone <YOUR_REPOSITORY_URL>
-cd geoshift-competition
-
-python -m venv .venv
-```
-
-### Windows
-
-```bash
-.venv\Scripts\activate
-```
-
-### Linux/macOS
-
-```bash
-source .venv/bin/activate
-```
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
+                     RAW DATA
+                        │
+                        ▼
+                Region extraction
+                        │
+                        ▼
+             StratifiedGroupKFold
+                        │
+          ┌─────────────┴─────────────┐
+          │           ...             │
+          ▼                           ▼
+       Fold 0                       Fold 4
+          │                           │
+          ▼                           ▼
+   Train-only stats           Train-only stats
+          │                           │
+          ▼                           ▼
+   Data augmentation          Data augmentation
+          │                           │
+          ▼                           ▼
+    ConvNeXt + ViT             ConvNeXt + ViT
+          │                           │
+          ▼                           ▼
+       EMA model                    EMA model
+          │                           │
+          ▼                           ▼
+     Best checkpoint             Best checkpoint
+          │                           │
+          └─────────────┬─────────────┘
+                        ▼
+                 OOF predictions
+                        │
+                        ▼
+                 Error analysis
+                        │
+                        ▼
+                Class-bias tuning
+                        │
+                        ▼
+                Test predictions
+                        │
+                        ▼
+                   8× TTA
+                        │
+                        ▼
+                 Fold ensemble
+                        │
+                        ▼
+                    Submission
 ```
 
 ---
 
-# Dataset Layout
+# 23. How to Use the Current Pipeline
 
-The training script expects the following files inside the configured data directory:
+## Requirements
+
+Install:
+
+```bash
+pip install numpy pandas scikit-learn torch torchvision
+```
+
+For the final competition environment, the recommended practice is to use the exact versions recorded in `requirements.txt`.
+
+---
+
+## Dataset layout
+
+The current code expects:
 
 ```text
 data/
@@ -525,81 +749,476 @@ data/
 └── sample_submission.csv
 ```
 
-The image tensors are expected to have the following structure:
+Expected image shape:
 
 ```text
-train_images.npy:
+train_images.npy
 (N, 4, 64, 64)
 
-test_images.npy:
+test_images.npy
 (N_test, 4, 64, 64)
 ```
 
-Dataset files are intentionally excluded from this repository.
+The code checks this shape explicitly.
 
 ---
 
-# Running the Code
+# 24. Configure the Data Directory
 
-## 1. Smoke test
+In the configuration:
 
-Run the end-to-end pipeline on synthetic data:
+```python
+CFG = dict(
+    data_dir="data",
+    ...
+)
+```
+
+The repository version should avoid hard-coded personal paths.
+
+---
+
+# 25. Run a Smoke Test
+
+Before training on the real dataset:
 
 ```bash
 python src/geoshift_convnext_vit_v2.py smoke
 ```
 
-This verifies that dataset creation, cross-validation, training, checkpointing, OOF generation and submission generation work correctly.
+The smoke test creates a small synthetic dataset in the same file format expected by the real pipeline and executes the training/submission flow.
+
+A successful run ends with:
+
+```text
+SMOKE TEST PASSED — pipeline runs end-to-end.
+```
+
+The current code implements this synthetic end-to-end test.
 
 ---
 
-## 2. Full training
+# 26. Run Full Training
 
 ```bash
 python src/geoshift_convnext_vit_v2.py train
 ```
 
-Optional:
+This performs:
+
+```text
+Data loading
+→ region extraction
+→ 5-fold CV
+→ model training
+→ checkpoint saving
+→ OOF generation
+→ test prediction
+→ ensemble
+→ submission creation
+```
+
+---
+
+# 27. Run Selected Folds
+
+For a faster experiment:
+
+```bash
+python src/geoshift_convnext_vit_v2.py train --folds 0
+```
+
+Multiple folds:
 
 ```bash
 python src/geoshift_convnext_vit_v2.py train --folds 0 1 2
 ```
 
-or:
-
-```bash
-python src/geoshift_convnext_vit_v2.py train --epochs 30
-```
+This is useful when comparing configurations before committing to a complete five-fold run.
 
 ---
 
-## 3. Re-generate predictions
+# 28. Limit the Number of Epochs
 
-After checkpoints have been created:
+```bash
+python src/geoshift_convnext_vit_v2.py train --epochs 5
+```
+
+This is useful for:
+
+* debugging
+* hardware benchmarking
+* configuration checks
+* quick ablations
+
+---
+
+# 29. Run Different Model Presets
+
+The current pipeline contains several controlled experiment presets.
+
+### Default tuned model
+
+```bash
+python src/geoshift_convnext_vit_v2.py train --preset tuned
+```
+
+### Higher-resolution feature representation
+
+```bash
+python src/geoshift_convnext_vit_v2.py train --preset hires
+```
+
+### Per-image normalisation
+
+```bash
+python src/geoshift_convnext_vit_v2.py train --preset perimage
+```
+
+### GAP classifier instead of Transformer
+
+```bash
+python src/geoshift_convnext_vit_v2.py train --preset gap
+```
+
+### Region-balanced sampling
+
+```bash
+python src/geoshift_convnext_vit_v2.py train --preset regbal
+```
+
+### Lower logit-adjustment temperature
+
+```bash
+python src/geoshift_convnext_vit_v2.py train --preset tau05
+```
+
+The presets are explicitly defined in the source.
+
+---
+
+# 30. Re-generate Test Predictions
+
+Once fold checkpoints exist:
 
 ```bash
 python src/geoshift_convnext_vit_v2.py predict
 ```
 
----
+This:
 
-## Reproducibility
-
-The implementation uses a fixed random seed and separately seeds individual folds.
-
-For reproducible experiments, record:
-
-* Git commit
-* Python version
-* PyTorch version
-* torchvision version
-* CUDA version
-* GPU model
-* preset/configuration
-* fold IDs
-* number of epochs
-* final checkpoint
-* resulting OOF Macro-F1
-* competition submission ID, where applicable
+1. loads the saved fold checkpoints
+2. generates test probabilities
+3. applies the configured TTA
+4. rebuilds the ensemble
+5. writes the final submission files
 
 ---
+
+# 31. Output Files
+
+The pipeline generates files such as:
+
+```text
+v2_tuned/
+├── fold0.pth
+├── fold1.pth
+├── ...
+├── history_fold0.csv
+├── history_fold1.csv
+├── ...
+├── oof_fold0.npz
+├── oof_fold1.npz
+├── ...
+├── oof_confusion_matrix.csv
+├── oof_region_accuracy.csv
+├── test_probs_fold0.npy
+├── test_probs_fold1.npy
+├── ...
+├── test_probs_ensemble.npy
+├── submission_v2_nobias.csv
+├── submission_v2_bias.csv
+└── ensemble_meta.json
+```
+
+The checkpoint stores the model configuration, fold, best epoch, validation score and normalization statistics required for later inference.
+
+---
+
+# 32. Error Analysis
+
+The competition should not be evaluated using only the final Macro-F1.
+
+The repository therefore includes analysis of:
+
+### Per-class performance
+
+```text
+Precision
+Recall
+F1
+```
+
+### Confusion matrix
+
+Which classes are systematically confused?
+
+### Region-wise performance
+
+Which geographic regions are hardest?
+
+### Training vs validation behaviour
+
+Does the model overfit the training regions?
+
+### Failure examples
+
+Visualise:
+
+* confident wrong predictions
+* low-confidence predictions
+* recurring class confusions
+* difficult geographic regions
+
+The current pipeline already computes a confusion matrix and region-level accuracy from OOF predictions.
+
+---
+
+# 33. Interpreting Model Failures
+
+A useful way to analyse a failure is:
+
+```text
+Wrong prediction
+      │
+      ├── Spectral ambiguity?
+      │
+      ├── Spatial ambiguity?
+      │
+      ├── Class imbalance?
+      │
+      ├── Region-specific appearance?
+      │
+      ├── Insufficient spatial resolution?
+      │
+      └── Annotation ambiguity?
+```
+
+This separates **model failure** from **information limitations in the input**.
+
+A misclassified sample is not necessarily evidence that the architecture is inadequate; some classes may genuinely overlap in their spectral/spatial signatures.
+
+---
+
+# 34. Configuration Reference
+
+The main configuration is stored in `CFG`.
+
+Important parameters include:
+
+```python
+num_classes = 6
+n_folds = 5
+epochs = 30
+batch_size = 128
+
+lr_backbone = 1e-4
+lr_stem = 2e-4
+lr_head = 5e-4
+
+weight_decay = 0.05
+drop_path = 0.3
+
+backbone_stages = 3
+head_type = "vit"
+
+vit_dim = 384
+vit_heads = 6
+vit_layers = 2
+
+use_indices = True
+norm_mode = "global"
+
+mixup_prob = 0.20
+cutmix_prob = 0.10
+
+test_tta = True
+```
+
+The complete configuration is defined at the top of the training script.
+
+---
+
+# 35. Reproducibility
+
+For every reported experiment, record:
+
+```text
+Git commit
+Python version
+PyTorch version
+Torchvision version
+GPU / accelerator
+Random seed
+Preset
+Fold IDs
+Epoch count
+OOF Macro-F1
+Leaderboard score
+```
+
+## The training script uses a fixed seed and additionally offsets the seed by fold.
+
+# 36. Results
+
+## Model comparison
+
+Add the actual measured results here:
+
+| Approach              | Validation Strategy | OOF Macro-F1 | Notes                       |
+| --------------------- | ------------------- | -----------: | --------------------------- |
+| Baseline CNN          | Random split        |      XX.XXXX | Region leakage risk         |
+| ConvNeXt baseline     | Random split        |      XX.XXXX | Stronger backbone           |
+| Region-aware ConvNeXt | Grouped CV          |      XX.XXXX | More realistic estimate     |
+| ConvNeXt + ViT        | Grouped CV          |      XX.XXXX | Spatial token reasoning     |
+| + NDVI/NDWI           | Grouped CV          |      XX.XXXX | Spectral feature enrichment |
+| + Shift augmentation  | Grouped CV          |      XX.XXXX | Better robustness           |
+| Final ensemble        | Grouped CV          |      XX.XXXX | TTA + fold ensemble         |
+
+**Important:** replace every placeholder with the actual measured result. Do not claim an improvement unless the corresponding experiment was actually run.
+
+---
+
+# 37. Main Findings
+
+The main methodological findings from the development process are:
+
+### Geographic validation matters
+
+A random split does not directly test the competition's geographic generalisation requirement.
+
+### Spatial representation matters
+
+Giving the Transformer more than a handful of spatial tokens makes the attention mechanism more meaningful.
+
+### Spectral information matters
+
+NIR and derived indices provide information unavailable to RGB-only models.
+
+### Radiometric robustness matters
+
+The model should not over-rely on illumination or region-specific intensity distributions.
+
+### Optimisation details matter
+
+Learning-rate scheduling, EMA and regularisation can materially affect training stability.
+
+### Inference matters
+
+Fold ensembling and TTA provide a second level of robustness beyond the single trained model.
+
+---
+
+# 38. Limitations
+
+This solution still has limitations.
+
+### 1. Computational cost
+
+Five-fold training combined with TTA is considerably more expensive than a single model.
+
+### 2. OOF bias tuning
+
+The class-bias search is optimised using OOF predictions and can overestimate the real-world gain.
+
+### 3. Dataset dependence
+
+The best feature engineering and augmentation strategy may change for another multispectral dataset.
+
+### 4. Limited spatial resolution
+
+At 64×64 pixels, some classes may remain inherently ambiguous.
+
+### 5. Geographic grouping quality
+
+The quality of the region metadata directly affects the validity of the grouped evaluation.
+
+---
+
+# 39. Repository
+
+The repository is organised so that a reviewer can move from:
+
+```text
+README
+   ↓
+Methodology
+   ↓
+Source Code
+   ↓
+Experiments
+   ↓
+Error Analysis
+   ↓
+Final Results
+```
+
+without needing to inspect the entire training script first.
+
+---
+
+# 40. Team
+
+**Team:** `<TEAM NAME>`
+
+**Members:**
+
+* `<MEMBER 1>`
+* `<MEMBER 2>`
+* `<MEMBER 3>`
+* `<MEMBER 4>`
+
+---
+
+## Quick Start
+
+```bash
+git clone <REPOSITORY_URL>
+cd GeoShift
+
+pip install -r requirements.txt
+
+python src/geoshift_convnext_vit_v2.py smoke
+
+python src/geoshift_convnext_vit_v2.py train
+
+python src/geoshift_convnext_vit_v2.py predict
+```
+
+---
+
+## Final Takeaway
+
+The final solution was not obtained simply by making the network larger.
+
+The main development process was:
+
+```text
+Initial model
+     ↓
+Observed failure
+     ↓
+Identify cause
+     ↓
+Change methodology / architecture
+     ↓
+Evaluate under region-aware validation
+     ↓
+Repeat
+     ↓
+Final ensemble pipeline
+```
+
+The resulting system is therefore a combination of:
+
+**region-aware evaluation + multispectral representation + spatial feature reasoning + shift-oriented augmentation + robust optimisation + ensemble inference.**
